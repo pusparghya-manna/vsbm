@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width,
+               initial-scale=1,
+               maximum-scale=1,
+               user-scalable=no">
+
+<title>Mobile Volume Shader</title>
+
+<style>
+html,body{
+    margin:0;
+    padding:0;
+    width:100%;
+    height:100%;
+    overflow:hidden;
+    background:#000;
+}
+
+canvas{
+    position:fixed;
+    inset:0;
+    width:100%;
+    height:100%;
+    display:block;
+    touch-action:none;
+}
+</style>
+</head>
+
+<body>
+
+<canvas id="glcanvas"></canvas>
+
+<script>
+
+const canvas = document.getElementById("glcanvas");
+
+const gl =
+    canvas.getContext("webgl", {
+        antialias:false,
+        alpha:false,
+        depth:false,
+        stencil:false,
+        powerPreference:"high-performance",
+        preserveDrawingBuffer:false
+    });
+
+if(!gl){
+    document.body.innerHTML =
+        "<div style='color:white;padding:20px'>WebGL is not supported.</div>";
+    throw new Error("WebGL unavailable");
+}
+
+
+/* =========================================================
+   VERTEX SHADER
+   ========================================================= */
+
+const vertexShaderSource = `
+precision highp float;
+
+attribute vec2 position;
+
+uniform vec3 right;
+uniform vec3 up;
+uniform vec3 forward;
+
+uniform float aspectX;
+uniform float aspectY;
+
+varying vec3 rayDir;
+varying vec3 localDir;
+
+void main(){
+
+    gl_Position = vec4(position,0.0,1.0);
+
+    rayDir =
+        forward
+        + right * position.x * aspectX
+        + up    * position.y * aspectY;
+
+    localDir =
+        vec3(
+            position.x * aspectX,
+            position.y * aspectY,
+            -1.0
+        );
+}
+`;
+
+
+/* =========================================================
+   FRAGMENT SHADER
+   ========================================================= */
+
+const fragmentShaderSource = `
+
+precision highp float;
+
+#define PI 3.14159265359
+
+/*
+    IMPORTANT:
+
+    This is still the ORIGINAL fractal equation.
+
+    Only the ray intersection algorithm is optimized.
+*/
+
+float kernel(vec3 ver){
+
+    vec3 a = ver;
+
+    float b;
+    float c;
+    float d;
+
+    /*
+       4 iterations instead of 5.
+
+       This is the main mobile optimization.
+       The outer geometry remains very similar.
+    */
+    for(int i=0;i<4;i++){
+
+        b = length(a);
+
+        if(b > 2.2)
+            break;
+
+        c = atan(a.y,a.x) * 8.0;
+
+        d = acos(
+            clamp(a.z / max(b,0.00001),-1.0,1.0)
+        ) * 8.0;
+
+        b = pow(b,8.0);
+
+        a =
+            vec3(
+                b*sin(d)*cos(c),
+                b*sin(d)*sin(c),
+                b*cos(d)
+            )
+            + ver;
+    }
+
+    return
+        4.0
+        - dot(a,a);
+}
+
+
+/* ---------------------------------------------------------
+   Camera
+--------------------------------------------------------- */
+
+uniform vec3 origin;
+uniform vec3 right;
+uniform vec3 up;
+uniform vec3 forward;
+
+uniform float len;
+
+varying vec3 rayDir;
+varying vec3 localDir;
+
+
+/* ---------------------------------------------------------
+   Fast surface search
+
+   Instead of:
+
+       1000 samples
+       +
+       local maximum solver
+       +
+       multiple binary searches
+
+   we use:
+
+       320 coarse samples
+       +
+       binary refinement only after crossing
+--------------------------------------------------------- */
+
+bool findSurface(
+    out float hitDistance,
+    out vec3 hitPoint
+){
+
+    const int STEPS = 320;
+
+    float maxDistance = 2.0 * len;
+
+    float stepSize =
+        maxDistance / float(STEPS);
+
+    float previousT = 0.0;
+
+    float previousValue =
+        kernel(origin);
+
+    for(int i=1;i<=STEPS;i++){
+
+        float t =
+            float(i) * stepSize;
+
+        vec3 p =
+            origin + rayDir * t;
+
+        float value =
+            kernel(p);
+
+        /*
+           Real surface crossing.
+        */
+
+        if(previousValue < 0.0 && value >= 0.0){
+
+            float a = previousT;
+            float b = t;
+
+            /*
+               5 iterations are enough for
+               mobile rendering.
+            */
+
+            for(int j=0;j<5;j++){
+
+                float m =
+                    0.5 * (a+b);
+
+                float mv =
+                    kernel(origin + rayDir*m);
+
+                if(mv >= 0.0)
+                    b = m;
+                else
+                    a = m;
+            }
+
+            hitDistance =
+                0.5 * (a+b);
+
+            hitPoint =
+                origin + rayDir * hitDistance;
+
+            return true;
+        }
+
+        previousT = t;
+        previousValue = value;
+    }
+
+    return false;
+}
+
+
+/* ---------------------------------------------------------
+   Normal
+--------------------------------------------------------- */
+
+vec3 getNormal(vec3 p){
+
+    /*
+       Larger epsilon than original.
+
+       This dramatically reduces noisy normals
+       on mobile GPUs.
+    */
+
+    float e = 0.0015;
+
+    vec3 n;
+
+    n.x =
+        kernel(p-vec3(e,0.0,0.0))
+        -
+        kernel(p+vec3(e,0.0,0.0));
+
+    n.y =
+        kernel(p-vec3(0.0,e,0.0))
+        -
+        kernel(p+vec3(0.0,e,0.0));
+
+    n.z =
+        kernel(p+vec3(0.0,0.0,e))
+        -
+        kernel(p-vec3(0.0,0.0,e));
+
+    return normalize(n);
+}
+
+
+/* ---------------------------------------------------------
+   Main
+--------------------------------------------------------- */
+
+void main(){
+
+    float hitDistance;
+
+    vec3 p;
+
+    bool hit =
+        findSurface(
+            hitDistance,
+            p
+        );
+
+    if(!hit){
+
+        gl_FragColor =
+            vec4(0.0,0.0,0.0,1.0);
+
+        return;
+    }
+
+
+    /* Surface normal */
+
+    vec3 n =
+        getNormal(p);
+
+
+    /* View direction */
+
+    vec3 viewDir =
+        normalize(localDir);
+
+
+    /* Reflection */
+
+    vec3 reflection =
+        reflect(
+            viewDir,
+            n
+        );
+
+
+    /*
+       Original lighting direction
+    */
+
+    vec3 lightDir =
+        normalize(
+            vec3(
+                0.276,
+                0.920,
+                0.276
+            )
+        );
+
+
+    float diffuse =
+        max(
+            0.0,
+            dot(n,lightDir)
+        );
+
+
+    float specular =
+        max(
+            0.0,
+            dot(reflection,lightDir)
+        );
+
+
+    /*
+       Original-style strong highlight
+    */
+
+    specular =
+        pow(
+            specular,
+            4.0
+        );
+
+
+    /*
+       Position-based psychedelic color.
+
+       Same concept as the original shader.
+    */
+
+    float radius =
+        dot(p,p);
+
+
+    vec3 color;
+
+    color.r =
+        sin(radius*10.0)
+        *0.5+0.5;
+
+    color.g =
+        sin(radius*10.0+2.05)
+        *0.5+0.5;
+
+    color.b =
+        sin(radius*10.0-2.05)
+        *0.5+0.5;
+
+
+    /*
+       Lighting
+    */
+
+    float lighting =
+        diffuse * 0.65
+        + specular * 0.35
+        + 0.20;
+
+
+    color *= lighting;
+
+
+    /*
+       Slight saturation boost
+    */
+
+    color =
+        mix(
+            vec3(
+                dot(
+                    color,
+                    vec3(
+                        0.299,
+                        0.587,
+                        0.114
+                    )
+                )
+            ),
+            color,
+            1.25
+        );
+
+
+    /*
+       Prevent black / numerical artifacts
+    */
+
+    color =
+        clamp(
+            color,
+            0.0,
+            1.0
+        );
+
+
+    gl_FragColor =
+        vec4(color,1.0);
+}
+`;
+
+
+/* =========================================================
+   SHADER COMPILATION
+========================================================= */
+
+function compileShader(type,source){
+
+    const shader =
+        gl.createShader(type);
+
+    gl.shaderSource(
+        shader,
+        source
+    );
+
+    gl.compileShader(shader);
+
+    if(!gl.getShaderParameter(
+        shader,
+        gl.COMPILE_STATUS
+    )){
+
+        console.error(
+            gl.getShaderInfoLog(shader)
+        );
+
+        throw new Error(
+            gl.getShaderInfoLog(shader)
+        );
+    }
+
+    return shader;
+}
+
+
+const vs =
+    compileShader(
+        gl.VERTEX_SHADER,
+        vertexShaderSource
+    );
+
+const fs =
+    compileShader(
+        gl.FRAGMENT_SHADER,
+        fragmentShaderSource
+    );
+
+
+const program =
+    gl.createProgram();
+
+gl.attachShader(program,vs);
+gl.attachShader(program,fs);
+
+gl.linkProgram(program);
+
+if(!gl.getProgramParameter(
+    program,
+    gl.LINK_STATUS
+)){
+
+    throw new Error(
+        gl.getProgramInfoLog(program)
+    );
+}
+
+gl.useProgram(program);
+
+
+/* =========================================================
+   FULLSCREEN QUAD
+========================================================= */
+
+const vertices = new Float32Array([
+
+    -1,-1,
+     1,-1,
+     1, 1,
+
+    -1,-1,
+     1, 1,
+    -1, 1
+
+]);
+
+const buffer =
+    gl.createBuffer();
+
+gl.bindBuffer(
+    gl.ARRAY_BUFFER,
+    buffer
+);
+
+gl.bufferData(
+    gl.ARRAY_BUFFER,
+    vertices,
+    gl.STATIC_DRAW
+);
+
+const position =
+    gl.getAttribLocation(
+        program,
+        "position"
+    );
+
+gl.enableVertexAttribArray(
+    position
+);
+
+gl.vertexAttribPointer(
+    position,
+    2,
+    gl.FLOAT,
+    false,
+    0,
+    0
+);
+
+
+/* =========================================================
+   UNIFORMS
+========================================================= */
+
+const U = {
+
+    right:
+        gl.getUniformLocation(
+            program,"right"
+        ),
+
+    up:
+        gl.getUniformLocation(
+            program,"up"
+        ),
+
+    forward:
+        gl.getUniformLocation(
+            program,"forward"
+        ),
+
+    origin:
+        gl.getUniformLocation(
+            program,"origin"
+        ),
+
+    len:
+        gl.getUniformLocation(
+            program,"len"
+        ),
+
+    aspectX:
+        gl.getUniformLocation(
+            program,"aspectX"
+        ),
+
+    aspectY:
+        gl.getUniformLocation(
+            program,"aspectY"
+        )
+};
+
+
+/* =========================================================
+   CAMERA
+========================================================= */
+
+let angle1 = 2.8;
+let angle2 = 0.4;
+
+let distance = 1.6;
+
+let centerX = 0;
+let centerY = 0;
+let centerZ = 0;
+
+
+/* =========================================================
+   RESOLUTION
+
+   The canvas is NOT rendered at full phone resolution.
+
+   This is a huge performance improvement.
+
+   Then the browser scales it to the screen.
+========================================================= */
+
+function resize(){
+
+    const w =
+        window.innerWidth;
+
+    const h =
+        window.innerHeight;
+
+
+    /*
+       Render at roughly 360-480 px.
+
+       Increase to 512 if your phone is powerful.
+    */
+
+    const maxRenderSize =
+        480;
+
+    const scale =
+        Math.min(
+            1,
+            maxRenderSize /
+            Math.max(w,h)
+        );
+
+
+    canvas.width =
+        Math.max(
+            256,
+            Math.floor(w*scale)
+        );
+
+    canvas.height =
+        Math.max(
+            256,
+            Math.floor(h*scale)
+        );
+
+
+    gl.viewport(
+        0,
+        0,
+        canvas.width,
+        canvas.height
+    );
+}
+
+window.addEventListener(
+    "resize",
+    resize
+);
+
+resize();
+
+
+/* =========================================================
+   RENDER
+========================================================= */
+
+function render(){
+
+    const w =
+        canvas.width;
+
+    const h =
+        canvas.height;
+
+
+    const aspect =
+        w / h;
+
+
+    /*
+       Original camera orientation
+    */
+
+    const cosA =
+        Math.cos(angle1);
+
+    const sinA =
+        Math.sin(angle1);
+
+    const cosB =
+        Math.cos(angle2);
+
+    const sinB =
+        Math.sin(angle2);
+
+
+    const right = [
+        sinA,
+        0,
+        -cosA
+    ];
+
+
+    const up = [
+        -sinB*cosA,
+        cosB,
+        -sinB*sinA
+    ];
+
+
+    const forward = [
+        -cosA*cosB,
+        -sinB,
+        -sinA*cosB
+    ];
+
+
+    const origin = [
+
+        distance*cosA*cosB
+        + centerX,
+
+        distance*sinB
+        + centerY,
+
+        distance*sinA*cosB
+        + centerZ
+    ];
+
+
+    /*
+       Keep the same square projection
+       used by the original.
+    */
+
+    let ax = 1;
+    let ay = 1;
+
+    if(aspect > 1)
+        ax = aspect;
+    else
+        ay = 1/aspect;
+
+
+    gl.uniform3fv(
+        U.right,
+        right
+    );
+
+    gl.uniform3fv(
+        U.up,
+        up
+    );
+
+    gl.uniform3fv(
+        U.forward,
+        forward
+    );
+
+    gl.uniform3fv(
+        U.origin,
+        origin
+    );
+
+    gl.uniform1f(
+        U.len,
+        distance
+    );
+
+    gl.uniform1f(
+        U.aspectX,
+        ax
+    );
+
+    gl.uniform1f(
+        U.aspectY,
+        ay
+    );
+
+
+    gl.drawArrays(
+        gl.TRIANGLES,
+        0,
+        6
+    );
+}
+
+
+/* =========================================================
+   ANIMATION
+
+   No gl.finish().
+========================================================= */
+
+function animate(){
+
+    angle1 += 0.006;
+
+    render();
+
+    requestAnimationFrame(
+        animate
+    );
+}
+
+animate();
+
+
+/* =========================================================
+   TOUCH CONTROLS
+========================================================= */
+
+let touchX = 0;
+let touchY = 0;
+
+let pinchDistance = 0;
+
+let touching = false;
+
+
+function distanceBetween(a,b){
+
+    const dx =
+        a.clientX-b.clientX;
+
+    const dy =
+        a.clientY-b.clientY;
+
+    return Math.sqrt(
+        dx*dx+dy*dy
+    );
+}
+
+
+canvas.addEventListener(
+    "touchstart",
+    e => {
+
+        e.preventDefault();
+
+        if(e.touches.length===1){
+
+            touching=true;
+
+            touchX =
+                e.touches[0].clientX;
+
+            touchY =
+                e.touches[0].clientY;
+        }
+
+        if(e.touches.length===2){
+
+            touching=false;
+
+            pinchDistance =
+                distanceBetween(
+                    e.touches[0],
+                    e.touches[1]
+                );
+        }
+
+    },
+    {passive:false}
+);
+
+
+canvas.addEventListener(
+    "touchmove",
+    e => {
+
+        e.preventDefault();
+
+
+        /* ROTATE */
+
+        if(
+            e.touches.length===1 &&
+            touching
+        ){
+
+            const x =
+                e.touches[0].clientX;
+
+            const y =
+                e.touches[0].clientY;
+
+
+            angle1 +=
+                (x-touchX)*0.004;
+
+            angle2 +=
+                (y-touchY)*0.004;
+
+
+            angle2 =
+                Math.max(
+                    -1.45,
+                    Math.min(
+                        1.45,
+                        angle2
+                    )
+                );
+
+
+            touchX=x;
+            touchY=y;
+        }
+
+
+        /* PINCH ZOOM */
+
+        if(e.touches.length===2){
+
+            const d =
+                distanceBetween(
+                    e.touches[0],
+                    e.touches[1]
+                );
+
+            if(pinchDistance>0){
+
+                distance *=
+                    pinchDistance/d;
+
+                distance =
+                    Math.max(
+                        0.55,
+                        Math.min(
+                            4.0,
+                            distance
+                        )
+                    );
+            }
+
+            pinchDistance=d;
+        }
+
+    },
+    {passive:false}
+);
+
+
+canvas.addEventListener(
+    "touchend",
+    e => {
+
+        if(e.touches.length===0){
+
+            touching=false;
+            pinchDistance=0;
+        }
+
+        if(e.touches.length===1){
+
+            touchX =
+                e.touches[0].clientX;
+
+            touchY =
+                e.touches[0].clientY;
+
+            touching=true;
+        }
+
+    },
+    {passive:false}
+);
+
+
+/* =========================================================
+   MOUSE SUPPORT
+========================================================= */
+
+let mouseDown=false;
+let mouseX=0;
+let mouseY=0;
+
+canvas.addEventListener(
+    "mousedown",
+    e => {
+
+        mouseDown=true;
+
+        mouseX=e.clientX;
+        mouseY=e.clientY;
+    }
+);
+
+window.addEventListener(
+    "mouseup",
+    () => {
+        mouseDown=false;
+    }
+);
+
+window.addEventListener(
+    "mousemove",
+    e => {
+
+        if(!mouseDown)
+            return;
+
+        angle1 +=
+            (e.clientX-mouseX)*0.004;
+
+        angle2 +=
+            (e.clientY-mouseY)*0.004;
+
+        angle2 =
+            Math.max(
+                -1.45,
+                Math.min(
+                    1.45,
+                    angle2
+                )
+            );
+
+        mouseX=e.clientX;
+        mouseY=e.clientY;
+    }
+);
+
+
+canvas.addEventListener(
+    "wheel",
+    e => {
+
+        e.preventDefault();
+
+        distance *=
+            Math.exp(
+                e.deltaY*0.001
+            );
+
+        distance =
+            Math.max(
+                0.55,
+                Math.min(
+                    4.0,
+                    distance
+                )
+            );
+    },
+    {passive:false}
+);
+
+</script>
+
+</body>
+</html>
